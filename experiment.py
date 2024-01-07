@@ -2,44 +2,38 @@ import torch
 import torch.nn as nn
 import numpy as np
 import copy
-#from cancer_simulation import get_standard_params
+import torch.optim.lr_scheduler as lr_scheduler
 
-NUM_TRAIN = 1000
-NUM_VAL = 100
-NUM_TEST = 100
+NUM_TRAIN = 10000
+NUM_VAL = 1000
+NUM_TEST = 1000
 epochs = 50
-learning_rate = 5e-3
 device = torch.device("cpu")
 torch.manual_seed(42)
 
 def get_data_simple_cancer(size):
-    # Treatment at time 0. Two options, 1 or 2.
-    #TODO: Right now A0 does not have any influence
-    A0 = torch.randint(0, 2, (size,)).float()
 
     # Initial tumor size uniform between possible sizes
-    #L1 = torch.Tensor(size).uniform_(500, 1150)
-    #L1 = torch.Tensor(get_standard_params(size)['initial_volumes'])
-    L1 = torch.Tensor(size).uniform_(0, 1)
+    X0 = torch.Tensor(size).uniform_(0, 1)
 
     # Applying therapy or not bernoulli of probability deppending on the size
-    A1 = torch.bernoulli(L1)
+    A0 = torch.bernoulli(X0)
 
     # We normalize the data (we do not care about saving mean and std to get real data back)
-    L1 = (L1 - torch.mean(L1))/torch.std(L1)
+    #X0 = (X0 - torch.mean(X0))/torch.std(X0)
 
     # If we apply therapy, half tumor size (if A1 has effect on Y)
-    Y = []
-    for i, l in enumerate(L1):
-        if(A1[i] == 0):
-            Y.append(l)
+    Y1 = []
+    for i, x in enumerate(X0):
+        if(A0[i] == 0):
+            Y1.append(x)
         else:
-            Y.append(l)
+            Y1.append(x)
 
     # We create the dataset for the BalanceNet
     dataset = []
-    for i in range(len(Y)):
-        dataset.append([torch.tensor((A0[i], L1[i], A1[i])), torch.tensor((Y[i], A1[i]))])
+    for i in range(len(Y1)):
+        dataset.append([torch.tensor((X0[i], A0[i])), torch.tensor((Y1[i], A0[i]))])
     
     return dataset
 
@@ -61,12 +55,14 @@ def grad_reverse(x, scale=1.0):
 
 # Loss to avoid predicting A1 if balance = True
 class BalancingLoss(nn.Module):
-    def __init__(self, balance=True):
+    def __init__(self, balance=True, ini_lambda_param = 0, gamma = 10):
         super(BalancingLoss, self).__init__()
         self.p = 0
         self.BCE = torch.nn.BCELoss()
         self.MSE = torch.nn.MSELoss()
         self.balance = balance
+        self.ini_lambda_param = ini_lambda_param
+        self.gamma = gamma
 
     def forward(self, inputs, targets):
         #Mean Square Error of Y
@@ -75,13 +71,13 @@ class BalancingLoss(nn.Module):
         #Binary Cross Entropy of A1
         A_bce = self.BCE(inputs[1], targets[1])
 
-        #TODO: I had to manually finetune lambda so that classes get equilibrated
         if(self.balance):
             #Schedule of lambda on the original Domain Adversarial Paper 
-            lambda_param = 2/(1 + np.exp(-10*self.p)) - 1
-            #lambda_param = 1.5
-            #self.p += 1/(NUM_TRAIN * epochs)
-            lambda_param = 1
+            if(self.ini_lambda_param == 0):
+                lambda_param = 2/(1 + np.exp(-self.gamma*self.p)) - 1
+                self.p += 1/(NUM_TRAIN * epochs)
+            else:
+                lambda_param = self.ini_lambda_param
         else:
             lambda_param = 0
         
@@ -111,7 +107,7 @@ class BalancerNet(nn.Module):
         super().__init__()
         self.flatten = nn.Flatten()
         self.linear_elu_stack_phi = nn.Sequential(
-            nn.Linear(2, 48),
+            nn.Linear(1, 48),
             nn.ELU(),
             nn.Linear(48, 1),
         )
@@ -129,15 +125,14 @@ class BalancerNet(nn.Module):
         self.balance = balance
 
     def forward(self, x):
-        A0, L1, A1 = x
+        L0, A0 = x
+        L0 = L0.reshape(1)
         A0 = A0.reshape(1)
-        L1 = L1.reshape(1)
-        A1 = A1.reshape(1)
 
         # Calculate representation
-        phi = self.linear_elu_stack_phi(torch.cat((A0, L1)))
+        phi = self.linear_elu_stack_phi(L0)
 
-        # Adversarial training for predicting A_1
+        # Adversarial training for predicting A_0
         if(self.balance):
             phi_rev = grad_reverse(phi)
             logit_a = self.linear_elu_stack_A(phi_rev)
@@ -145,7 +140,7 @@ class BalancerNet(nn.Module):
             logit_a = torch.tensor(0.5).reshape(1)
             
         # Predict Y using representation and A_1
-        pred_y = self.linear_elu_stack_Y(torch.cat((phi, A1)))
+        pred_y = self.linear_elu_stack_Y(torch.cat((phi, A0)))
 
         return torch.cat((pred_y, logit_a, phi))
 
@@ -190,16 +185,16 @@ def test_loop(dataset, model, balance):
     # Set the model to evaluation mode 
     model.eval()
     test_loss = 0.0
-    loss = torch.nn.MSELoss()
+    loss = BalancingLoss(False)
     accuracy_prediction_a = 0
     # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
     # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
     with torch.no_grad():
         for X, y in dataset:
             Y, A1 = y
-            Y_pred, A_pred, _ = model(X)
-            test_loss += loss(Y_pred, Y).item()
-            if(((A_pred > 0.5) and A1 == 1) or ((A_pred <= 0.5) and A1 == 0)):
+            pred = model(X)
+            test_loss += loss(pred[:-1], y).item()
+            if(((pred[1] > 0.5) and A1 == 1) or ((pred[1] <= 0.5) and A1 == 0)):
                     accuracy_prediction_a += 1
 
     if(not balance):
@@ -214,11 +209,11 @@ def test_loop(dataset, model, balance):
 def train_A(dataset, model, model_a, optimizer_a):
     loss_a = torch.nn.BCELoss()
     for X, y in dataset:
-        Y, A1 = y
+        Y, A0 = y
         with torch.no_grad():
             _, _, phi = model(X)
         pred = model_a(phi.detach().reshape(1))
-        loss_res_a = loss_a(pred, A1.reshape(1))
+        loss_res_a = loss_a(pred, A0.reshape(1))
 
         # Backpropagation
         loss_res_a.backward()
@@ -232,10 +227,10 @@ def test_A(dataset, model, model_a):
 
     with torch.no_grad():
         for X, y in dataset:
-            _, A1 = y
+            _, A0 = y
             _, _, phi = model(X)
             A_pred = model_a(phi.reshape(1))
-            if(((A_pred > 0.5) and A1 == 1) or ((A_pred <= 0.5) and A1 == 0)):
+            if(((A_pred > 0.5) and A0 == 1) or ((A_pred <= 0.5) and A0 == 0)):
                     accuracy_prediction_a += 1
     accuracy_prediction_a = accuracy_prediction_a/len(dataset)
     print(f"Accuracy prediction A no balance: {accuracy_prediction_a * 100}% \n")
@@ -247,18 +242,20 @@ dataset_val = get_data_simple_cancer(NUM_VAL)
 dataset_test = get_data_simple_cancer(NUM_TEST)
 
 
-def experiment(balance, warmup, A_predictor):
+def experiment(balance, warmup, A_predictor, ini_lambda = 0, gamma=10):
     epochs = 50
-    loss_fn = BalancingLoss(balance)
+    loss_fn = BalancingLoss(balance, ini_lambda, gamma)
     model = BalancerNet(balance)
     model_a = ANet()
 
     # We use SDG with momentum 0.9
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     optimizer_a = torch.optim.SGD(model_a.parameters(), lr=learning_rate, momentum=0.9)
+    scheduler = lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.5, total_iters=50)
 
     best_loss = torch.inf
     no_improve_counter = 0
+    best_model_epoch = 0
     for t in range(epochs):
         print(f"Epoch {t+1}\n-------------------------------")
         train_loop(dataset_train, model, loss_fn, optimizer, balance)
@@ -267,13 +264,16 @@ def experiment(balance, warmup, A_predictor):
             best_loss = res_loss
             no_improve_counter = 0
             best_model = copy.deepcopy(model)
+            best_model_epoch = t
         elif(t >= warmup):
             no_improve_counter += 1
         if(no_improve_counter >= 4):
-            pass
+            break
+        scheduler.step()
     
     print("TEST RESULTS: ")
-    test_loop(dataset_test, model, balance)
+    test_loop(dataset_test, best_model, balance)
+    print("Best model epoch: ", best_model_epoch)
 
     if(A_predictor):
         print("Training A external predictor:")
@@ -283,8 +283,8 @@ def experiment(balance, warmup, A_predictor):
         warmup = 10
         for t in range(epochs):
             print(f"Epoch {t+1}\n-------------------------------")
-            train_A(dataset_train, model, model_a, optimizer_a)
-            accuracy = test_A(dataset_val, model, model_a)
+            train_A(dataset_train, best_model, model_a, optimizer_a)
+            accuracy = test_A(dataset_val, best_model, model_a)
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 no_improve_counter = 0
@@ -295,13 +295,20 @@ def experiment(balance, warmup, A_predictor):
             if(no_improve_counter >= 4):
                 break
         print("Test A results:")
-        test_A(dataset_test, model, best_model_a)
+        test_A(dataset_test, best_model, best_model_a)
 
     print("Done!")
 
 
-print("Experiment with balance:")
-experiment(True, 5, True)
+
+print("Experiment with balance lambda = 1")
+learning_rate = 1e-4
+experiment(True, 15, True, 1, 10)
+
+print("Experiment with DA balance, gamma = 10:")
+learning_rate = 1e-4
+experiment(True, 30, True)
 
 print("Experiment without balance:")
+learning_rate = 1e-4
 experiment(False, 0, True)
