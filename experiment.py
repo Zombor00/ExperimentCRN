@@ -37,6 +37,12 @@ def get_data_simple_cancer(size):
     
     return dataset
 
+def get_data_simple_cancer_counterfactual(factual_data):
+    dataset = []
+    for elem1, elem2 in factual_data:
+        dataset.append([torch.tensor((elem1[0], (elem1[1]+1)%2)), torch.tensor((elem2[0], (elem2[1]+1)%2))])
+    return dataset
+
 # Basic Gradient Reverse Layer with scale = 1
 class GradientReverse(torch.autograd.Function):
     scale = 1
@@ -239,7 +245,7 @@ def test_A(dataset, model, model_a):
 
 dataset_train = get_data_simple_cancer(NUM_TRAIN)
 dataset_val = get_data_simple_cancer(NUM_VAL)
-dataset_test = get_data_simple_cancer(NUM_TEST)
+dataset_test = get_data_simple_cancer_counterfactual(dataset_train[:NUM_TEST])
 
 
 def experiment(balance, warmup, A_predictor, ini_lambda = 0, gamma=10):
